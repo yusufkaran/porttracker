@@ -1,14 +1,27 @@
 # PortTracker
 
-Manage your localhost ports. See which dev servers are running, from which project, and kill them when needed.
+Not just "what ports are open?" — **"which of my projects are running right now?"**
 
-```
-$ pt ls
-PORT   PID    PROJECT     DIRECTORY                  COMMAND    UPTIME
-3000   12607  my-app      ~/Projects/my-app          node       2h 13m
-3001   13102  api         ~/Projects/api             node       45m
-8081   14200  mobile      ~/Projects/mobile          metro      1h 02m
-```
+PortTracker is a fast CLI + interactive TUI that lists your listening ports, detects which project they belong to, and lets you kill them by port or project name. Works on macOS and Linux.
+
+![PortTracker Screenshot](screenshot.png)
+
+## Why PortTracker?
+
+There are many port killing tools out there. Here's what makes PortTracker different:
+
+| Feature | pt | fkill | killport | kill-port | LazyPorts |
+|---|---|---|---|---|---|
+| Interactive TUI | Yes | Fuzzy list | No | No | Yes |
+| Auto project detection | Yes | No | No | No | No |
+| Kill by project name | Yes | No | No | No | No |
+| Grouped by project | Yes | No | No | No | No |
+| Directory + uptime | Yes | No | No | No | No |
+| Search / filter | Yes | Fuzzy | No | No | Yes |
+| Kill confirmation | Yes | No | No | No | No |
+| Single binary, zero deps | Yes (Go) | No (Node) | Yes (Rust) | No (Node) | Yes (Go) |
+
+Most tools answer "kill port 3000". PortTracker answers **"what's running, where, and for how long?"**
 
 ## Install
 
@@ -16,10 +29,10 @@ PORT   PID    PROJECT     DIRECTORY                  COMMAND    UPTIME
 # Homebrew (macOS/Linux)
 brew install yusufkaran/tap/porttracker
 
-# Or download from releases
-curl -fsSL https://github.com/yusufkaran/porttracker/releases/latest/download/install.sh | sh
+# Quick install
+curl -fsSL https://raw.githubusercontent.com/yusufkaran/porttracker/main/install.sh | sh
 
-# Or build from source
+# Go
 go install github.com/yusufkaran/porttracker/cmd/pt@latest
 ```
 
@@ -33,29 +46,26 @@ pt kill my-app  # Kill all processes matching project name
 pt 3000         # Shortcut for: pt kill 3000
 ```
 
-### Interactive TUI
+## Features
 
-Run `pt` without arguments to open the interactive view:
+- **Project grouping** — Ports grouped by project, dev projects on top, system ports dimmed at the bottom
+- **Auto project detection** — Reads `package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, or falls back to directory name
+- **Search** — `/` to filter by port, project, or command name
+- **Kill with confirmation** — `x` to kill selected port, `X` to kill entire project, confirms before killing
+- **Open in browser** — `o` to open `localhost:<port>` directly
+- **Fast** — Single binary, batch port scanning in <200ms
 
-```
-⚡ PortTracker
+## Keyboard Shortcuts
 
-PORT    PID     PROJECT              DIRECTORY                   COMMAND           UPTIME
-3000    12607   my-app               ~/Projects/my-app           node              2h 13m
-3001    13102   api                  ~/Projects/api              node              45m
-8081    14200   mobile               ~/Projects/mobile           metro             1h 02m
-
-↑↓ navigate • k kill • K kill project • o open • r refresh • q quit
-```
-
-### Project Detection
-
-PortTracker automatically detects project names by reading:
-- `package.json` (Node.js)
-- `go.mod` (Go)
-- `Cargo.toml` (Rust)
-- `pyproject.toml` (Python)
-- Falls back to directory name
+| Key | Action |
+|---|---|
+| `j` / `k` / `↑` / `↓` | Navigate |
+| `x` | Kill selected port |
+| `X` | Kill all ports of selected project |
+| `o` | Open in browser |
+| `/` | Search / filter |
+| `r` | Refresh |
+| `q` | Quit |
 
 ## License
 

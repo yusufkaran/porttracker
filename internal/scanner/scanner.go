@@ -27,7 +27,6 @@ func Scan() ([]process.PortInfo, error) {
 func scanUnix() ([]process.PortInfo, error) {
 	out, err := exec.Command("lsof", "-iTCP", "-sTCP:LISTEN", "-nP", "-F", "pcnf").Output()
 	if err != nil {
-		// lsof may exit 1 if no results
 		if len(out) == 0 {
 			return nil, nil
 		}
@@ -43,9 +42,9 @@ func scanUnix() ([]process.PortInfo, error) {
 	var currentPID int
 	var currentCommand string
 
-	scanner := bufio.NewScanner(strings.NewReader(string(out)))
-	for scanner.Scan() {
-		line := scanner.Text()
+	sc := bufio.NewScanner(strings.NewReader(string(out)))
+	for sc.Scan() {
+		line := sc.Text()
 		if len(line) < 2 {
 			continue
 		}
@@ -59,7 +58,6 @@ func scanUnix() ([]process.PortInfo, error) {
 		case 'c':
 			currentCommand = value
 		case 'n':
-			// Format: *:PORT or 127.0.0.1:PORT or [::1]:PORT
 			idx := strings.LastIndex(value, ":")
 			if idx >= 0 {
 				portStr := value[idx+1:]
@@ -75,7 +73,7 @@ func scanUnix() ([]process.PortInfo, error) {
 		}
 	}
 
-	// Deduplicate by port (same port can appear for IPv4 and IPv6)
+	// Deduplicate by port
 	seen := make(map[int]bool)
 	var unique []rawEntry
 	for _, e := range entries {
@@ -85,17 +83,31 @@ func scanUnix() ([]process.PortInfo, error) {
 		}
 	}
 
+	// Collect unique PIDs
+	pidSet := make(map[int]bool)
+	for _, e := range unique {
+		pidSet[e.pid] = true
+	}
+	var pids []int
+	for pid := range pidSet {
+		pids = append(pids, pid)
+	}
+
+	// Batch fetch: dirs, uptimes, users in single calls
+	dirs := batchGetDirs(pids)
+	uptimes, users := batchGetPsInfo(pids)
+
 	var results []process.PortInfo
 	for _, e := range unique {
-		dir := getProcessDir(e.pid)
+		dir := dirs[e.pid]
 		info := process.PortInfo{
 			Port:    e.port,
 			PID:     e.pid,
 			Command: e.command,
 			Dir:     dir,
 			Project: process.DetectProject(dir),
-			Uptime:  getProcessUptime(e.pid),
-			User:    getProcessUser(e.pid),
+			Uptime:  uptimes[e.pid],
+			User:    users[e.pid],
 		}
 		results = append(results, info)
 	}
@@ -107,51 +119,95 @@ func scanUnix() ([]process.PortInfo, error) {
 	return results, nil
 }
 
-func getProcessDir(pid int) string {
+// batchGetDirs gets working directories for all PIDs in one lsof call
+func batchGetDirs(pids []int) map[int]string {
+	dirs := make(map[int]string)
+	if len(pids) == 0 {
+		return dirs
+	}
+
 	switch runtime.GOOS {
 	case "darwin":
-		out, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
-		if err != nil {
-			return ""
+		// Build comma-separated PID list for lsof
+		pidStrs := make([]string, len(pids))
+		for i, pid := range pids {
+			pidStrs[i] = strconv.Itoa(pid)
 		}
+		pidArg := strings.Join(pidStrs, ",")
+
+		out, err := exec.Command("lsof", "-a", "-p", pidArg, "-d", "cwd", "-Fpn").Output()
+		if err != nil {
+			return dirs
+		}
+
+		var currentPID int
 		for _, line := range strings.Split(string(out), "\n") {
-			if strings.HasPrefix(line, "n") && !strings.HasPrefix(line, "n/dev") {
-				return line[1:]
+			if len(line) < 2 {
+				continue
+			}
+			switch line[0] {
+			case 'p':
+				pid, _ := strconv.Atoi(line[1:])
+				currentPID = pid
+			case 'n':
+				dir := line[1:]
+				if dir != "" && dir != "/" {
+					dirs[currentPID] = dir
+				}
 			}
 		}
+
 	case "linux":
-		link, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
-		if err == nil {
-			return link
+		for _, pid := range pids {
+			link, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
+			if err == nil {
+				dirs[pid] = link
+			}
 		}
 	}
-	return ""
+
+	return dirs
 }
 
-func getProcessUptime(pid int) time.Duration {
-	switch runtime.GOOS {
-	case "darwin":
-		out, err := exec.Command("ps", "-o", "etime=", "-p", strconv.Itoa(pid)).Output()
-		if err != nil {
-			return 0
-		}
-		return parseEtime(strings.TrimSpace(string(out)))
-	case "linux":
-		out, err := exec.Command("ps", "-o", "etimes=", "-p", strconv.Itoa(pid)).Output()
-		if err != nil {
-			return 0
-		}
-		secs, _ := strconv.Atoi(strings.TrimSpace(string(out)))
-		return time.Duration(secs) * time.Second
+// batchGetPsInfo gets uptime and user for all PIDs in one ps call
+func batchGetPsInfo(pids []int) (map[int]time.Duration, map[int]string) {
+	uptimes := make(map[int]time.Duration)
+	users := make(map[int]string)
+	if len(pids) == 0 {
+		return uptimes, users
 	}
-	return 0
+
+	pidStrs := make([]string, len(pids))
+	for i, pid := range pids {
+		pidStrs[i] = strconv.Itoa(pid)
+	}
+	pidArg := strings.Join(pidStrs, ",")
+
+	out, err := exec.Command("ps", "-o", "pid=,etime=,user=", "-p", pidArg).Output()
+	if err != nil {
+		return uptimes, users
+	}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		uptimes[pid] = parseEtime(fields[1])
+		users[pid] = fields[2]
+	}
+
+	return uptimes, users
 }
 
 // parseEtime parses ps etime format: [[dd-]hh:]mm:ss
 func parseEtime(s string) time.Duration {
 	var days, hours, minutes, seconds int
 
-	// Check for days
 	if idx := strings.Index(s, "-"); idx >= 0 {
 		days, _ = strconv.Atoi(s[:idx])
 		s = s[idx+1:]
@@ -174,14 +230,6 @@ func parseEtime(s string) time.Duration {
 		time.Duration(hours)*time.Hour +
 		time.Duration(minutes)*time.Minute +
 		time.Duration(seconds)*time.Second
-}
-
-func getProcessUser(pid int) string {
-	out, err := exec.Command("ps", "-o", "user=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
 }
 
 func KillPort(port int) error {

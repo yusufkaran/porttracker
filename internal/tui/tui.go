@@ -2,8 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -62,16 +64,49 @@ var (
 			Foreground(lipgloss.Color("241")).
 			Italic(true).
 			MarginTop(1)
+
+	groupHeaderStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("75"))
+
+	dimStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("245"))
+
+	systemStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("243"))
+
+	searchStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Bold(true)
+
+	confirmStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
+)
+
+type confirmAction int
+
+const (
+	confirmNone confirmAction = iota
+	confirmKill
+	confirmKillAll
 )
 
 type model struct {
-	ports    []process.PortInfo
+	allPorts []process.PortInfo // unfiltered
+	ports    []process.PortInfo // displayed (filtered + sorted)
 	cursor   int
 	width    int
 	height   int
 	status   string
 	err      error
 	quitting bool
+	// search
+	searching bool
+	query     string
+	// confirm
+	confirming    confirmAction
+	confirmTarget process.PortInfo
 }
 
 type portsMsg []process.PortInfo
@@ -94,6 +129,56 @@ func scanPorts() tea.Msg {
 	return portsMsg(ports)
 }
 
+// sortAndGroup sorts ports: projects with directories first (grouped), system ports last
+func sortAndGroup(ports []process.PortInfo) []process.PortInfo {
+	sorted := make([]process.PortInfo, len(ports))
+	copy(sorted, ports)
+
+	sort.SliceStable(sorted, func(i, j int) bool {
+		iHasDir := sorted[i].Dir != "" && sorted[i].Dir != "/"
+		jHasDir := sorted[j].Dir != "" && sorted[j].Dir != "/"
+
+		// Ports with directories come first
+		if iHasDir != jHasDir {
+			return iHasDir
+		}
+
+		// Within same group, sort by project name then port
+		if iHasDir && jHasDir {
+			if sorted[i].Project != sorted[j].Project {
+				return sorted[i].Project < sorted[j].Project
+			}
+		}
+		return sorted[i].Port < sorted[j].Port
+	})
+
+	return sorted
+}
+
+func filterPorts(ports []process.PortInfo, query string) []process.PortInfo {
+	if query == "" {
+		return ports
+	}
+	q := strings.ToLower(query)
+	var result []process.PortInfo
+	for _, p := range ports {
+		if strings.Contains(strings.ToLower(p.Project), q) ||
+			strings.Contains(strings.ToLower(p.Dir), q) ||
+			strings.Contains(strings.ToLower(p.Command), q) ||
+			strings.Contains(strconv.Itoa(p.Port), q) {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+func (m *model) updateFiltered() {
+	m.ports = sortAndGroup(filterPorts(m.allPorts, m.query))
+	if m.cursor >= len(m.ports) {
+		m.cursor = max(0, len(m.ports)-1)
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -101,11 +186,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 
 	case portsMsg:
-		m.ports = msg
+		m.allPorts = msg
 		m.err = nil
-		if m.cursor >= len(m.ports) {
-			m.cursor = max(0, len(m.ports)-1)
-		}
+		m.status = ""
+		m.updateFiltered()
 
 	case errMsg:
 		m.err = msg
@@ -115,10 +199,82 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, scanPorts
 
 	case tea.KeyMsg:
+		// Search mode input
+		if m.searching {
+			switch msg.String() {
+			case "enter", "esc":
+				m.searching = false
+				if msg.String() == "esc" {
+					m.query = ""
+					m.updateFiltered()
+				}
+			case "backspace":
+				if len(m.query) > 0 {
+					m.query = m.query[:len(m.query)-1]
+					m.updateFiltered()
+				}
+			case "ctrl+c":
+				m.quitting = true
+				return m, tea.Quit
+			default:
+				if len(msg.String()) == 1 {
+					m.query += msg.String()
+					m.updateFiltered()
+				}
+			}
+			return m, nil
+		}
+
+		// Confirm mode
+		if m.confirming != confirmNone {
+			switch msg.String() {
+			case "y", "Y":
+				if m.confirming == confirmKill {
+					p := m.confirmTarget
+					err := scanner.KillPID(p.PID)
+					m.confirming = confirmNone
+					if err != nil {
+						m.status = fmt.Sprintf("Error killing port %d: %s", p.Port, err)
+					} else {
+						return m, func() tea.Msg {
+							return killMsg{port: p.Port}
+						}
+					}
+				} else if m.confirming == confirmKillAll {
+					p := m.confirmTarget
+					killed := 0
+					for _, port := range m.ports {
+						if port.Project == p.Project && port.Dir == p.Dir {
+							if err := scanner.KillPID(port.PID); err == nil {
+								killed++
+							}
+						}
+					}
+					m.confirming = confirmNone
+					m.status = fmt.Sprintf("Killed %d processes for project %s", killed, p.Project)
+					return m, scanPorts
+				}
+			default:
+				m.confirming = confirmNone
+				m.status = ""
+			}
+			return m, nil
+		}
+
+		// Normal mode
 		switch {
 		case key.Matches(msg, keys.Quit):
 			m.quitting = true
 			return m, tea.Quit
+
+		case key.Matches(msg, keys.Search):
+			m.searching = true
+			m.query = ""
+			return m, nil
+
+		case key.Matches(msg, keys.ClearSearch):
+			m.query = ""
+			m.updateFiltered()
 
 		case key.Matches(msg, keys.Up):
 			if m.cursor > 0 {
@@ -133,29 +289,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, keys.Kill):
 			if len(m.ports) > 0 && m.cursor < len(m.ports) {
 				p := m.ports[m.cursor]
-				err := scanner.KillPID(p.PID)
-				if err != nil {
-					m.status = fmt.Sprintf("Error killing port %d: %s", p.Port, err)
-				} else {
-					return m, func() tea.Msg {
-						return killMsg{port: p.Port}
-					}
-				}
+				m.confirming = confirmKill
+				m.confirmTarget = p
+				m.status = fmt.Sprintf("Kill port %d (%s)? [y/N]", p.Port, p.Command)
 			}
 
 		case key.Matches(msg, keys.KillAll):
 			if len(m.ports) > 0 && m.cursor < len(m.ports) {
 				p := m.ports[m.cursor]
-				killed := 0
+				count := 0
 				for _, port := range m.ports {
 					if port.Project == p.Project && port.Dir == p.Dir {
-						if err := scanner.KillPID(port.PID); err == nil {
-							killed++
-						}
+						count++
 					}
 				}
-				m.status = fmt.Sprintf("Killed %d processes for project %s", killed, p.Project)
-				return m, scanPorts
+				m.confirming = confirmKillAll
+				m.confirmTarget = p
+				m.status = fmt.Sprintf("Kill all %d ports for %s? [y/N]", count, p.Project)
 			}
 
 		case key.Matches(msg, keys.Open):
@@ -185,13 +335,26 @@ func (m model) View() string {
 	b.WriteString(titleStyle.Render("⚡ PortTracker"))
 	b.WriteString("\n")
 
+	// Search bar
+	if m.searching {
+		b.WriteString(searchStyle.Render("/ ") + m.query + "█")
+		b.WriteString("\n")
+	} else if m.query != "" {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("filter: %s  ", m.query)) + dimStyle.Render("(esc clear)"))
+		b.WriteString("\n")
+	}
+
 	if m.err != nil {
 		b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %s", m.err)))
 		b.WriteString("\n")
 	}
 
 	if len(m.ports) == 0 {
-		b.WriteString(emptyStyle.Render("No listening ports found."))
+		if m.query != "" {
+			b.WriteString(emptyStyle.Render(fmt.Sprintf("No ports matching '%s'", m.query)))
+		} else {
+			b.WriteString(emptyStyle.Render("No listening ports found."))
+		}
 		b.WriteString("\n")
 		b.WriteString(helpStyle.Render("r refresh • q quit"))
 		return b.String()
@@ -205,9 +368,8 @@ func (m model) View() string {
 	colCommand := 18
 	colUptime := 10
 
-	// Adjust dir column based on terminal width
 	if m.width > 0 {
-		used := colPort + colPID + colProject + colCommand + colUptime + 6 // 6 for separators
+		used := colPort + colPID + colProject + colCommand + colUptime + 6
 		remaining := m.width - used
 		if remaining > 10 {
 			colDir = remaining
@@ -215,68 +377,121 @@ func (m model) View() string {
 	}
 
 	// Header
-	header := fmt.Sprintf("%-*s %-*s %-*s %-*s %-*s %-*s",
-		colPort, "PORT",
-		colPID, "PID",
-		colProject, "PROJECT",
-		colDir, "DIRECTORY",
-		colCommand, "COMMAND",
-		colUptime, "UPTIME",
-	)
+	header := pad("PORT", colPort) + pad("PID", colPID) + pad("PROJECT", colProject) +
+		pad("DIRECTORY", colDir) + pad("COMMAND", colCommand) + pad("UPTIME", colUptime)
 	b.WriteString(headerStyle.Render(header))
 	b.WriteString("\n")
 
-	// Rows
-	for i, p := range m.ports {
+	// Rows with group headers
+	lastProject := ""
+	lastDir := ""
+	rowIdx := 0
+	for _, p := range m.ports {
+		hasDir := p.Dir != "" && p.Dir != "/"
+		groupKey := p.Project + "|" + p.Dir
+
+		// Show group separator when project changes (only for project ports)
+		if hasDir && groupKey != lastProject+"|"+lastDir {
+			if rowIdx > 0 {
+				b.WriteString("\n")
+			}
+			label := fmt.Sprintf("── %s ", p.Project)
+			if p.Dir != "" {
+				label += dimStyle.Render(fmt.Sprintf("(%s)", shortenDir(p.Dir)))
+			}
+			b.WriteString(groupHeaderStyle.Render(label))
+			b.WriteString("\n")
+		} else if !hasDir && lastDir != "" {
+			b.WriteString("\n")
+			b.WriteString(dimStyle.Render("── System / Other"))
+			b.WriteString("\n")
+			lastDir = ""
+		}
+
+		if hasDir {
+			lastProject = p.Project
+			lastDir = p.Dir
+		}
+
 		dir := truncateLeft(p.Dir, colDir)
 		project := truncate(p.Project, colProject)
 		cmd := truncate(p.Command, colCommand)
 
-		row := fmt.Sprintf("%-*s %-*d %-*s %-*s %-*s %-*s",
-			colPort, portStyle.Render(strconv.Itoa(p.Port)),
-			colPID, p.PID,
-			colProject, projectStyle.Render(project),
-			colDir, dir,
-			colCommand, commandStyle.Render(cmd),
-			colUptime, uptimeStyle.Render(p.UptimeStr()),
-		)
+		portPad := pad(strconv.Itoa(p.Port), colPort)
+		pidPad := pad(strconv.Itoa(p.PID), colPID)
+		projPad := pad(project, colProject)
+		dirPad := pad(dir, colDir)
+		cmdPad := pad(cmd, colCommand)
+		uptPad := pad(p.UptimeStr(), colUptime)
 
-		if i == m.cursor {
-			b.WriteString(selectedStyle.Render(row))
+		var row string
+		if rowIdx == m.cursor {
+			row = selectedStyle.Render(portPad + pidPad + projPad + dirPad + cmdPad + uptPad)
+		} else if !hasDir {
+			row = systemStyle.Render(portPad+pidPad+projPad+dirPad+cmdPad+uptPad)
 		} else {
-			b.WriteString(normalStyle.Render(row))
+			row = portStyle.Render(portPad) +
+				normalStyle.Render(pidPad) +
+				projectStyle.Render(projPad) +
+				normalStyle.Render(dirPad) +
+				commandStyle.Render(cmdPad) +
+				uptimeStyle.Render(uptPad)
+		}
+
+		b.WriteString(row)
+		b.WriteString("\n")
+		rowIdx++
+	}
+
+	if m.status != "" {
+		if m.confirming != confirmNone {
+			b.WriteString(confirmStyle.Render(m.status))
+		} else {
+			b.WriteString(statusStyle.Render(m.status))
 		}
 		b.WriteString("\n")
 	}
 
-	if m.status != "" {
-		b.WriteString(statusStyle.Render(m.status))
-		b.WriteString("\n")
+	if m.confirming != confirmNone {
+		b.WriteString(helpStyle.Render("y confirm • any key cancel"))
+	} else if m.searching {
+		b.WriteString(helpStyle.Render("enter confirm • esc cancel"))
+	} else {
+		b.WriteString(helpStyle.Render("↑↓/jk navigate • x kill • X kill project • o open • / search • r refresh • q quit"))
 	}
-
-	b.WriteString(helpStyle.Render("↑↓ navigate • k kill • K kill project • o open • r refresh • q quit"))
 
 	return b.String()
 }
 
 type keyMap struct {
-	Up      key.Binding
-	Down    key.Binding
-	Kill    key.Binding
-	KillAll key.Binding
-	Open    key.Binding
-	Refresh key.Binding
-	Quit    key.Binding
+	Up          key.Binding
+	Down        key.Binding
+	Kill        key.Binding
+	KillAll     key.Binding
+	Open        key.Binding
+	Refresh     key.Binding
+	Quit        key.Binding
+	Search      key.Binding
+	ClearSearch key.Binding
 }
 
 var keys = keyMap{
-	Up:      key.NewBinding(key.WithKeys("up", "k")),
-	Down:    key.NewBinding(key.WithKeys("down", "j")),
-	Kill:    key.NewBinding(key.WithKeys("x", "delete")),
-	KillAll: key.NewBinding(key.WithKeys("X")),
-	Open:    key.NewBinding(key.WithKeys("o")),
-	Refresh: key.NewBinding(key.WithKeys("r")),
-	Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c")),
+	Up:          key.NewBinding(key.WithKeys("up", "k")),
+	Down:        key.NewBinding(key.WithKeys("down", "j")),
+	Kill:        key.NewBinding(key.WithKeys("x", "backspace", "delete")),
+	KillAll:     key.NewBinding(key.WithKeys("X")),
+	Open:        key.NewBinding(key.WithKeys("o")),
+	Refresh:     key.NewBinding(key.WithKeys("r")),
+	Quit:        key.NewBinding(key.WithKeys("q", "ctrl+c")),
+	Search:      key.NewBinding(key.WithKeys("/")),
+	ClearSearch: key.NewBinding(key.WithKeys("esc")),
+}
+
+func pad(s string, width int) string {
+	if len(s) >= width {
+		return s + " "
+	}
+	return s + strings.Repeat(" ", width-len(s))
 }
 
 func truncate(s string, maxLen int) string {
@@ -297,6 +512,14 @@ func truncateLeft(s string, maxLen int) string {
 		return s[len(s)-maxLen:]
 	}
 	return "..." + s[len(s)-maxLen+3:]
+}
+
+func shortenDir(dir string) string {
+	home, _ := os.UserHomeDir()
+	if home != "" && strings.HasPrefix(dir, home) {
+		return "~" + dir[len(home):]
+	}
+	return dir
 }
 
 func openBrowser(url string) {
