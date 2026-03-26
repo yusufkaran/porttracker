@@ -365,7 +365,7 @@ func (m model) View() string {
 	colPID := 8
 	colProject := 20
 	colDir := 30
-	colCommand := 18
+	colCommand := 28
 	colUptime := 10
 
 	if m.width > 0 {
